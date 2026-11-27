@@ -27,6 +27,7 @@ textarea:focus{outline:2px solid var(--cur)}
 #dot.live{background:#ff4d4d;box-shadow:0 0 0 4px rgba(255,77,77,.25)}
 #status{flex:1;min-width:0;line-height:1.3}
 #prog{flex:none;font-variant-numeric:tabular-nums}
+#heard{padding:6px 14px;font-size:13px;color:var(--cur);border-bottom:1px solid var(--line);min-height:30px;line-height:1.3;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 #reader{flex:1;min-height:0;overflow-y:auto;position:relative;padding:28vh 20px 70vh;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
 #text{font-size:var(--fs);line-height:1.55;font-weight:600;letter-spacing:.2px;color:var(--fg);word-break:break-word}
 .w{border-radius:6px;padding:0 .08em;transition:background .12s,color .12s}
@@ -48,7 +49,8 @@ textarea:focus{outline:2px solid var(--cur)}
 </section>
 
 <section id="read" class="view">
-  <div id="top"><span id="dot"></span><span id="status">Tap Start, then read.</span><span id="prog"></span></div>
+  <div id="top"><span id="dot"></span><span id="status">Tap Start, then read.</span><span id="prog"></span><button class="btn" id="tst" style="min-height:34px;font-size:13px;padding:0 10px">Test mic</button></div>
+  <div id="heard">Heard: (nothing yet)</div>
   <div id="reader"><div id="text"></div></div>
   <div id="bar">
     <button class="btn" id="edt" title="Edit script">✎</button>
@@ -152,7 +154,9 @@ textarea:focus{outline:2px solid var(--cur)}
     return false;
   }
 
+  function showHeard(t){ $('#heard').textContent='Heard: '+t; }
   function handle(key,text,isFinal){
+    showHeard(text);
     if(!words.length) return;
     var w=text.split(/\s+/).map(norm).filter(Boolean), n=w.length;
     var c=consumed.get(key)||0; if(c>n) c=n;
@@ -177,6 +181,7 @@ textarea:focus{outline:2px solid var(--cur)}
 
   function startListening(){
     keepAwake();
+    showHeard(dict?'(using Claude voice input)':(SR?'(using browser speech)':'(no speech support found)'));
     if(dict){
       wantListen=true;
       dict.start({language:'id'}).catch(function(err){
@@ -196,11 +201,14 @@ textarea:focus{outline:2px solid var(--cur)}
     if(!SR){ setStatus('This browser has no speech recognition. Use Chrome (Android) or Safari (iPhone), or tap words to move manually.'); return; }
     wantListen=true; consumed.clear();
     rec=new SR(); rec.lang='id-ID'; rec.continuous=true; rec.interimResults=true;
-    rec.onstart=function(){ listening=true; updateUI(); };
+    rec.onstart=function(){ listening=true; updateUI(); showHeard('(mic opening…)'); };
+    rec.onaudiostart=function(){ setStatus('Mic is on. Start reading.'); showHeard('(mic on, waiting for speech)'); };
+    rec.onspeechstart=function(){ setStatus('Hearing you…'); };
     rec.onresult=function(e){
       for(var i=e.resultIndex;i<e.results.length;i++) handle('w'+i,e.results[i][0].transcript,e.results[i].isFinal);
     };
     rec.onerror=function(e){
+      showHeard('error: '+e.error);
       if(e.error==='no-speech'||e.error==='aborted') return;
       wantListen=false;
       if(e.error==='not-allowed'||e.error==='service-not-allowed')
@@ -240,12 +248,38 @@ textarea:focus{outline:2px solid var(--cur)}
           listening=(e.state==='listening'||e.state==='starting');
           if(e.state==='idle') wantListen=false;
           updateUI();
+          showHeard('voice '+e.state+(e.reason?' ('+e.reason+')':''));
         });
       }).catch(function(){});
     }
   }catch(e){}
 
+  /* ---------- mic test ---------- */
+  function testMic(){
+    var ctx=(location.protocol||'?')+(window.isSecureContext?' secure':' NOT-secure')+(window.top!==window?' iframe':' top');
+    if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){ showHeard('Test: mic API missing ['+ctx+']'); return; }
+    showHeard('Test: asking Chrome for the mic… ['+ctx+']');
+    navigator.mediaDevices.getUserMedia({audio:true}).then(function(st){
+      var AC=window.AudioContext||window.webkitAudioContext, peak=0, t0=Date.now();
+      if(!AC){ st.getTracks().forEach(function(t){t.stop()}); showHeard('Test: mic allowed, but no audio meter ['+ctx+']'); return; }
+      var ac=new AC(), an=ac.createAnalyser(), buf=new Uint8Array(an.fftSize);
+      ac.createMediaStreamSource(st).connect(an);
+      var iv=setInterval(function(){
+        an.getByteTimeDomainData(buf);
+        var m=0; for(var i=0;i<buf.length;i++) m=Math.max(m,Math.abs(buf[i]-128));
+        peak=Math.max(peak,m);
+        var left=Math.max(0,5-Math.round((Date.now()-t0)/1000));
+        showHeard('Test: mic ALLOWED. Say something! level '+'█'.repeat(Math.min(20,Math.round(m/4)))+' ('+left+'s)');
+        if(Date.now()-t0>5000){
+          clearInterval(iv); st.getTracks().forEach(function(t){t.stop()}); try{ac.close()}catch(e){}
+          showHeard(peak>6?'Test: mic works and hears you ✔ ['+ctx+']':'Test: mic allowed but heard silence. Check phone mic/volume ['+ctx+']');
+        }
+      },100);
+    }).catch(function(e){ showHeard('Test FAILED: '+e.name+' ['+ctx+']'); });
+  }
+
   /* ---------- wiring ---------- */
+  $('#tst').onclick=testMic;
   function show(id){ document.querySelectorAll('.view').forEach(function(v){v.classList.toggle('on',v.id===id)}); }
 
   var src=$('#src'); src.value=load('vt.script')||SAMPLE;
