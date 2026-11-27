@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Voice Teleprompter</title>
+<style>
+:root{--fs:34px;--bg:#0b0d10;--panel:#161a20;--fg:#eceff3;--dim:#8a92a0;--acc:#ffd54a;--cur:#4fd1ff;--line:#262c35}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+body{height:100dvh;display:flex;flex-direction:column;padding:env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left)}
+.view{display:none;flex:1;min-height:0;flex-direction:column}
+.view.on{display:flex}
+/* editor */
+#edit{padding:16px;gap:12px}
+#edit h1{font-size:20px;margin:0}
+#edit p{margin:0;color:var(--dim);font-size:14px;line-height:1.45}
+textarea{flex:1;min-height:0;width:100%;resize:none;border:1px solid var(--line);border-radius:14px;background:var(--panel);color:var(--fg);font:inherit;font-size:17px;line-height:1.5;padding:14px}
+textarea:focus{outline:2px solid var(--cur)}
+.btn{border:0;border-radius:14px;min-height:50px;padding:0 18px;font:inherit;font-weight:600;font-size:16px;background:var(--panel);color:var(--fg);border:1px solid var(--line);cursor:pointer}
+.btn.primary{background:var(--acc);color:#1a1400;border-color:var(--acc)}
+.btn:active{transform:scale(.97)}
+#edit .btn{margin-bottom:calc(8px + env(safe-area-inset-bottom))}
+/* reader */
+#top{display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px solid var(--line);font-size:14px;color:var(--dim)}
+#dot{width:10px;height:10px;border-radius:50%;background:#555;flex:none}
+#dot.live{background:#ff4d4d;box-shadow:0 0 0 4px rgba(255,77,77,.25)}
+#status{flex:1;min-width:0;line-height:1.3}
+#prog{flex:none;font-variant-numeric:tabular-nums}
+#reader{flex:1;min-height:0;overflow-y:auto;position:relative;padding:28vh 20px 70vh;-webkit-overflow-scrolling:touch;overscroll-behavior:contain}
+#text{font-size:var(--fs);line-height:1.55;font-weight:600;letter-spacing:.2px;color:var(--fg);word-break:break-word}
+.w{border-radius:6px;padding:0 .08em;transition:background .12s,color .12s}
+.w.r{background:var(--acc);color:#1a1400}
+.w.c{box-shadow:0 3px 0 var(--cur)}
+#bar{display:flex;gap:8px;padding:10px 12px calc(10px + env(safe-area-inset-bottom));border-top:1px solid var(--line);background:var(--bg)}
+#bar .btn{min-width:50px;padding:0 12px}
+#mic{flex:1;font-size:17px}
+#mic.live{background:#ff4d4d;border-color:#ff4d4d;color:#fff}
+</style>
+</head>
+<body>
+
+<section id="edit" class="view on">
+  <h1>Voice Teleprompter</h1>
+  <p>Paste your script (Bahasa Indonesia). While you read aloud, each word you say gets highlighted. When you pause, it pauses.</p>
+  <textarea id="src" placeholder="Tempel naskah kamu di sini…" spellcheck="false"></textarea>
+  <button class="btn primary" id="go">Start reading</button>
+</section>
+
+<section id="read" class="view">
+  <div id="top"><span id="dot"></span><span id="status">Tap Start, then read.</span><span id="prog"></span></div>
+  <div id="reader"><div id="text"></div></div>
+  <div id="bar">
+    <button class="btn" id="edt" title="Edit script">✎</button>
+    <button class="btn" id="rst" title="Restart">⟲</button>
+    <button class="btn" id="fm" title="Smaller text">A−</button>
+    <button class="btn" id="fp" title="Bigger text">A+</button>
+    <button class="btn primary" id="mic">🎤 Start</button>
+  </div>
+</section>
+
+<script>
+(function(){
+  var $ = function(s){return document.querySelector(s)};
+  var SAMPLE = "Halo semuanya, selamat datang di video saya hari ini.\nHari ini saya akan bercerita tentang cara membuat konten dengan lebih percaya diri.\n\nPertama, siapkan naskah yang singkat dan jelas. Kedua, bacalah dengan tenang dan tidak terburu-buru. Terima kasih sudah menonton!";
+
+  var words = [], pos = 0, wantListen = false, listening = false;
+  var consumed = new Map(), dict = null, rec = null, lastTarget = -1e9, wake = null;
+  var LOOK = 6, SHORT_LOOK = 2, THRESH = 0.72;
+
+  function load(k){ try{ return localStorage.getItem(k) }catch(e){ return null } }
+  function save(k,v){ try{ localStorage.setItem(k,v) }catch(e){} }
+
+  /* ---------- text helpers ---------- */
+  function norm(s){
+    return s.toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g,'').replace(/[^\p{L}\p{N}]+/gu,'');
+  }
+  function lev(a,b){
+    var m=a.length,n=b.length; if(!m) return n; if(!n) return m;
+    var p=new Array(n+1),i,j; for(j=0;j<=n;j++) p[j]=j;
+    for(i=1;i<=m;i++){
+      var prev=p[0]; p[0]=i;
+      for(j=1;j<=n;j++){
+        var t=p[j];
+        p[j]=Math.min(p[j]+1,p[j-1]+1,prev+(a[i-1]===b[j-1]?0:1));
+        prev=t;
+      }
+    }
+    return p[n];
+  }
+  function sim(a,b){
+    if(a===b) return 1;
+    var m=Math.max(a.length,b.length);
+    if(m<4) return 0;
+    return 1-lev(a,b)/m;
+  }
+
+  /* ---------- build + render script ---------- */
+  function build(text){
+    var box=$('#text'); box.textContent=''; words=[]; pos=0; consumed.clear();
+    var lines=text.replace(/\r/g,'').split('\n');
+    lines.forEach(function(ln,li){
+      ln.split(/\s+/).filter(Boolean).forEach(function(t){
+        var s=document.createElement('span');
+        s.className='w'; s.textContent=t; s.dataset.i=words.length;
+        words.push({el:s,n:norm(t)});
+        box.appendChild(s); box.appendChild(document.createTextNode(' '));
+      });
+      if(li<lines.length-1) box.appendChild(document.createElement('br'));
+    });
+    lastTarget=-1e9;
+    $('#reader').scrollTop=0;
+    setPos(0,false);
+  }
+
+  function paint(lo,hi){
+    lo=Math.max(0,lo); hi=Math.min(words.length-1,hi);
+    for(var i=lo;i<=hi;i++){
+      var c=words[i].el.classList;
+      c.toggle('r',i<pos); c.toggle('c',i===pos);
+    }
+  }
+
+  function setPos(p,doScroll){
+    var old=pos, n=words.length;
+    pos=Math.max(0,Math.min(n,p));
+    while(pos<n && words[pos].n==='' && pos>old) pos++;
+    paint(Math.min(old,pos)-1,Math.max(old,pos)+1);
+    $('#prog').textContent=n?(Math.min(pos,n)+' / '+n):'';
+    if(n && pos>=n && listening) setStatus('Finished 🎉');
+    if(doScroll!==false) scrollToCur();
+  }
+
+  function scrollToCur(){
+    if(!words.length) return;
+    var w=words[Math.min(pos,words.length-1)], r=$('#reader');
+    var target=w.el.offsetTop-r.clientHeight*0.3;
+    var lh=parseFloat(getComputedStyle($('#text')).lineHeight)||40;
+    if(Math.abs(target-lastTarget)<lh*0.8 && Math.abs(target-r.scrollTop)<r.clientHeight*0.4) return;
+    lastTarget=target;
+    r.scrollTo({top:Math.max(0,target),behavior:'smooth'});
+  }
+
+  /* ---------- matching spoken words to script ---------- */
+  function feed1(h,exactOnly){
+    var look=h.length<=3?SHORT_LOOK:LOOK, end=Math.min(words.length,pos+look);
+    for(var j=pos;j<end;j++){
+      var w=words[j].n; if(!w) continue;
+      var s=sim(w,h);
+      if(exactOnly?s===1:s>=THRESH){ setPos(j+1,true); return true; }
+    }
+    return false;
+  }
+
+  function handle(key,text,isFinal){
+    if(!words.length) return;
+    var w=text.split(/\s+/).map(norm).filter(Boolean), n=w.length;
+    var c=consumed.get(key)||0; if(c>n) c=n;
+    var upto=isFinal?n:n-1, k;
+    for(k=c;k<upto;k++) feed1(w[k],false);
+    if(upto>c) c=upto;
+    if(!isFinal && n-1>=c){ if(feed1(w[n-1],true)) c=n; }  // last partial word: only exact, may be unfinished
+    if(isFinal && key==='d') consumed.delete(key); else consumed.set(key,c);
+  }
+
+  /* ---------- status / mic UI ---------- */
+  function setStatus(t){ $('#status').textContent=t; }
+  function updateUI(){
+    $('#dot').classList.toggle('live',listening);
+    var m=$('#mic'); m.classList.toggle('live',listening);
+    m.textContent=listening?'⏸ Pause':'🎤 Start';
+    if(listening) setStatus('Listening… read aloud.');
+  }
+
+  /* ---------- speech engines ---------- */
+  var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+
+  function startListening(){
+    keepAwake();
+    if(dict){
+      wantListen=true;
+      dict.start({language:'id'}).catch(function(err){
+        wantListen=false; listening=false; updateUI();
+        var code=err&&err.code;
+        if(code==='not_granted') setStatus('Microphone was declined. Allow it, or tap words to move manually.');
+        else if(code==='dismissed') setStatus('Tap Start again to allow the microphone.');
+        else if(code==='unavailable') setStatus('Voice not available for Indonesian here. Tap words to move manually.');
+        else if(code!=='stopped') setStatus('Voice error: '+(code||'unknown')+'. Tap words to move manually.');
+      });
+      return;
+    }
+    startWeb();
+  }
+
+  function startWeb(){
+    if(!SR){ setStatus('This browser has no speech recognition. Use Chrome (Android) or Safari (iPhone), or tap words to move manually.'); return; }
+    wantListen=true; consumed.clear();
+    rec=new SR(); rec.lang='id-ID'; rec.continuous=true; rec.interimResults=true;
+    rec.onstart=function(){ listening=true; updateUI(); };
+    rec.onresult=function(e){
+      for(var i=e.resultIndex;i<e.results.length;i++) handle('w'+i,e.results[i][0].transcript,e.results[i].isFinal);
+    };
+    rec.onerror=function(e){
+      if(e.error==='no-speech'||e.error==='aborted') return;
+      wantListen=false;
+      if(e.error==='not-allowed'||e.error==='service-not-allowed')
+        setStatus('Microphone blocked here. Open this page directly in Chrome/Safari and allow the mic, or tap words to move manually.');
+      else if(e.error==='network') setStatus('Speech needs an internet connection.');
+      else setStatus('Speech error: '+e.error);
+    };
+    rec.onend=function(){
+      listening=false;
+      if(wantListen){ consumed.clear(); try{ rec.start(); }catch(x){ wantListen=false; updateUI(); } }
+      else updateUI();
+    };
+    try{ rec.start(); }catch(x){ wantListen=false; setStatus('Could not start the microphone.'); }
+  }
+
+  function stopListening(){
+    wantListen=false;
+    try{ if(dict) dict.stop().catch(function(){}); }catch(e){}
+    try{ if(rec) rec.stop(); }catch(e){}
+    listening=false; updateUI(); setStatus('Paused. Tap Start to continue.');
+    release();
+  }
+
+  function keepAwake(){
+    try{ if(navigator.wakeLock && !wake) navigator.wakeLock.request('screen').then(function(l){wake=l;l.addEventListener('release',function(){wake=null})}).catch(function(){}); }catch(e){}
+  }
+  function release(){ try{ if(wake){wake.release();wake=null;} }catch(e){} }
+
+  /* optional platform dictation (when hosted as an artifact) */
+  try{
+    if(window.claude && window.claude.use){
+      window.claude.use('dictation').then(function(d){
+        if(!d) return; dict=d;
+        d.onPartial(function(e){ if(e.text) handle('d',e.text,false); });
+        d.onFinal(function(e){ if(e.text) handle('d',e.text,true); });
+        d.onState(function(e){
+          listening=(e.state==='listening'||e.state==='starting');
+          if(e.state==='idle') wantListen=false;
+          updateUI();
+        });
+      }).catch(function(){});
+    }
+  }catch(e){}
+
+  /* ---------- wiring ---------- */
+  function show(id){ document.querySelectorAll('.view').forEach(function(v){v.classList.toggle('on',v.id===id)}); }
+
+  var src=$('#src'); src.value=load('vt.script')||SAMPLE;
+  var fs=parseInt(load('vt.fs'),10)||34;
+  function applyFs(){ document.documentElement.style.setProperty('--fs',fs+'px'); save('vt.fs',fs); }
+  applyFs();
+
+  $('#go').onclick=function(){
+    var t=src.value.trim(); if(!t){ src.focus(); return; }
+    save('vt.script',src.value); build(t); show('read');
+    setStatus('Tap Start, then read.'); updateUI();
+  };
+  $('#edt').onclick=function(){ if(listening||wantListen) stopListening(); show('edit'); };
+  $('#rst').onclick=function(){ consumed.clear(); lastTarget=-1e9; setPos(0,false); $('#reader').scrollTo({top:0,behavior:'smooth'}); };
+  $('#fm').onclick=function(){ fs=Math.max(20,fs-4); applyFs(); lastTarget=-1e9; scrollToCur(); };
+  $('#fp').onclick=function(){ fs=Math.min(72,fs+4); applyFs(); lastTarget=-1e9; scrollToCur(); };
+  $('#mic').onclick=function(){ if(listening||wantListen) stopListening(); else startListening(); };
+  $('#text').addEventListener('click',function(e){
+    var s=e.target.closest&&e.target.closest('.w'); if(!s) return;
+    consumed.clear(); setPos(parseInt(s.dataset.i,10),true);
+  });
+  document.addEventListener('visibilitychange',function(){ if(document.hidden && (listening||wantListen)) stopListening(); });
+})();
+</script>
+</body>
+</html>
