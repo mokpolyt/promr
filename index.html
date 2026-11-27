@@ -144,18 +144,33 @@ textarea:focus{outline:2px solid var(--cur)}
   }
 
   /* ---------- matching spoken words to script ---------- */
+  var lastH='';
   function feed1(h,exactOnly){
-    var look=h.length<=3?SHORT_LOOK:LOOK, end=Math.min(words.length,pos+look);
-    for(var j=pos;j<end;j++){
+    var look=h.length<=3?SHORT_LOOK:LOOK, end=Math.min(words.length,pos+look), j;
+    for(j=pos;j<end;j++){
       var w=words[j].n; if(!w) continue;
       var s=sim(w,h);
-      if(exactOnly?s===1:s>=THRESH){ setPos(j+1,true); return true; }
+      if(exactOnly?s===1:s>=THRESH){ setPos(j+1,true); lastH=h; return true; }
     }
-    return false;
+    // resync: two spoken words in a row matching two script words in a row, further ahead
+    var ok=false;
+    if(!exactOnly && lastH && h.length>=3){
+      var end2=Math.min(words.length,pos+80);
+      for(j=pos+1;j<end2;j++){
+        if(words[j].n && words[j-1].n && sim(words[j].n,h)>=THRESH && sim(words[j-1].n,lastH)>=THRESH){ setPos(j+1,true); ok=true; break; }
+      }
+    }
+    lastH=h;
+    return ok;
   }
 
-  function showHeard(t){ $('#heard').textContent='Heard: '+t; }
+  var nres=0, nrestart=0, lastHeardText='';
+  function showHeard(t,noStat){
+    lastHeardText=t;
+    $('#heard').textContent='Heard: '+t+((noStat||t.indexOf('Test')===0)?'':'  ['+nres+' results, '+nrestart+' restarts]');
+  }
   function handle(key,text,isFinal){
+    nres++;
     showHeard(text);
     if(!words.length) return;
     var w=text.split(/\s+/).map(norm).filter(Boolean), n=w.length;
@@ -216,9 +231,19 @@ textarea:focus{outline:2px solid var(--cur)}
       else if(e.error==='network') setStatus('Speech needs an internet connection.');
       else setStatus('Speech error: '+e.error);
     };
+    var tries=0;
+    function restart(){
+      if(!wantListen) return;
+      consumed.clear();
+      try{ rec.start(); nrestart++; tries=0; }
+      catch(x){
+        if(++tries<=8) setTimeout(restart,400);
+        else { wantListen=false; listening=false; updateUI(); setStatus('Listening stopped. Tap Start again.'); }
+      }
+    }
     rec.onend=function(){
       listening=false;
-      if(wantListen){ consumed.clear(); try{ rec.start(); }catch(x){ wantListen=false; updateUI(); } }
+      if(wantListen){ updateUI(); setTimeout(restart,300); }
       else updateUI();
     };
     try{ rec.start(); }catch(x){ wantListen=false; setStatus('Could not start the microphone.'); }
